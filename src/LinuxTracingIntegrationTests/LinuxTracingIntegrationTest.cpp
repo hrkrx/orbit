@@ -18,9 +18,11 @@
 #include <thread>
 #include <utility>
 
+#include "IntegrationTestChildProcess.h"
+#include "IntegrationTestPuppet.h"
+#include "IntegrationTestUtils.h"
 #include "LinuxTracing/Tracer.h"
 #include "LinuxTracing/TracerListener.h"
-#include "LinuxTracingIntegrationTestPuppet.h"
 #include "ObjectUtils/Address.h"
 #include "ObjectUtils/ElfFile.h"
 #include "ObjectUtils/LinuxMap.h"
@@ -31,18 +33,8 @@
 #include "capture.pb.h"
 
 namespace orbit_linux_tracing_integration_tests {
+
 namespace {
-
-[[nodiscard]] bool IsRunningAsRoot() { return geteuid() == 0; }
-
-[[nodiscard]] bool CheckIsRunningAsRoot() {
-  if (IsRunningAsRoot()) {
-    return true;
-  }
-
-  ERROR("Root required for this test");
-  return false;
-}
 
 [[nodiscard]] int ReadPerfEventParanoid() {
   auto error_or_content = orbit_base::ReadFileToString("/proc/sys/kernel/perf_event_paranoid");
@@ -85,82 +77,6 @@ namespace {
   ERROR("Stadia instance required for this test (but kernel release is \"%s\")", release);
   return false;
 }
-
-class ChildProcess {
- public:
-  explicit ChildProcess(const std::function<int()>& child_main) {
-    std::array<int, 2> parent_to_child_pipe{};
-    CHECK(pipe(parent_to_child_pipe.data()) == 0);
-
-    std::array<int, 2> child_to_parent_pipe{};
-    CHECK(pipe(child_to_parent_pipe.data()) == 0);
-
-    pid_t child_pid = fork();
-    CHECK(child_pid >= 0);
-    if (child_pid > 0) {
-      // Parent.
-      child_pid_ = child_pid;
-
-      // Close unused ends of the pipes.
-      CHECK(close(parent_to_child_pipe[0]) == 0);
-      CHECK(close(child_to_parent_pipe[1]) == 0);
-
-      reading_fd_ = child_to_parent_pipe[0];
-      writing_fd_ = parent_to_child_pipe[1];
-
-    } else {
-      // Child.
-
-      // Close unused ends of the pipes.
-      CHECK(close(parent_to_child_pipe[1]) == 0);
-      CHECK(close(child_to_parent_pipe[0]) == 0);
-
-      // Redirect reading end of parent_to_child_pipe to stdin and close the pipe's original fd.
-      CHECK(close(STDIN_FILENO) == 0);
-      CHECK(dup2(parent_to_child_pipe[0], STDIN_FILENO) == STDIN_FILENO);
-      CHECK(close(parent_to_child_pipe[0]) == 0);
-
-      // Redirect writing end of child_to_parent_pipe to stdout and close the pipe's original fd.
-      CHECK(close(STDOUT_FILENO) == 0);
-      CHECK(dup2(child_to_parent_pipe[1], STDOUT_FILENO) == STDOUT_FILENO);
-      CHECK(close(child_to_parent_pipe[1]) == 0);
-
-      // Run the child and exit.
-      exit(child_main());
-    }
-  }
-
-  ~ChildProcess() {
-    CHECK(close(reading_fd_) == 0);
-    CHECK(close(writing_fd_) == 0);
-
-    CHECK(waitpid(child_pid_, nullptr, 0) == child_pid_);
-  }
-
-  [[nodiscard]] pid_t GetChildPidNative() const { return child_pid_; }
-
-  void WriteLine(std::string_view str) {
-    std::string string_with_newline = std::string{str}.append("\n");
-    CHECK(write(writing_fd_, string_with_newline.c_str(), string_with_newline.length()) ==
-          static_cast<ssize_t>(string_with_newline.length()));
-  }
-
-  [[nodiscard]] std::string ReadLine() {
-    std::string str;
-    while (true) {
-      char c;
-      CHECK(read(reading_fd_, &c, sizeof(c)) == sizeof(c));
-      if (c == '\n' || c == '\0') break;
-      str.push_back(c);
-    }
-    return str;
-  }
-
- private:
-  pid_t child_pid_ = -1;
-  int reading_fd_ = -1;
-  int writing_fd_ = -1;
-};
 
 class BufferTracerListener : public orbit_linux_tracing::TracerListener {
  public:
@@ -326,7 +242,7 @@ class BufferTracerListener : public orbit_linux_tracing::TracerListener {
 // Let's make the fixture ourselves, which is also advised in http://go/totw/122.
 class LinuxTracingIntegrationTestFixture {
  public:
-  LinuxTracingIntegrationTestFixture() : puppet_{&LinuxTracingIntegrationTestPuppetMain} {}
+  LinuxTracingIntegrationTestFixture() : puppet_{&IntegrationTestPuppetMain} {}
 
   [[nodiscard]] pid_t GetPuppetPidNative() const { return puppet_.GetChildPidNative(); }
   [[nodiscard]] uint32_t GetPuppetPid() const {
@@ -337,10 +253,10 @@ class LinuxTracingIntegrationTestFixture {
 
   [[nodiscard]] std::string ReadLineFromPuppet() { return puppet_.ReadLine(); }
 
-  [[nodiscard]] orbit_grpc_protos::CaptureOptions BuildDefaultCaptureOptions() {
+  [[nodiscard]] orbit_grpc_protos::CaptureOptions BuildDefaultCaptureOptions() const {
     orbit_grpc_protos::CaptureOptions capture_options;
     capture_options.set_trace_context_switches(true);
-    capture_options.set_pid(orbit_base::FromNativeProcessId(puppet_.GetChildPidNative()));
+    capture_options.set_pid(GetPuppetPid());
     capture_options.set_samples_per_second(1000.0);
     capture_options.set_stack_dump_size(65000);
     capture_options.set_unwinding_method(orbit_grpc_protos::CaptureOptions::kDwarf);
@@ -349,7 +265,8 @@ class LinuxTracingIntegrationTestFixture {
     return capture_options;
   }
 
-  void StartTracingAndWaitForTracingLoopStarted(orbit_grpc_protos::CaptureOptions capture_options) {
+  void StartTracingAndWaitForTracingLoopStarted(
+      const orbit_grpc_protos::CaptureOptions& capture_options) {
     CHECK(tracer_ == nullptr);
     CHECK(!listener_.has_value());
 
@@ -359,7 +276,8 @@ class LinuxTracingIntegrationTestFixture {
     }
 
     listener_.emplace();
-    tracer_ = orbit_linux_tracing::Tracer::Create(capture_options, &listener_.value());
+    tracer_ = orbit_linux_tracing::Tracer::Create(
+        capture_options, /*user_space_instrumentation_addresses=*/nullptr, &listener_.value());
     tracer_->Start();
 
     if (IsRunningAsRoot()) {
@@ -391,7 +309,7 @@ class LinuxTracingIntegrationTestFixture {
   std::optional<BufferTracerListener> listener_ = std::nullopt;
 };
 
-using PuppetConstants = LinuxTracingIntegrationTestPuppetConstants;
+using PuppetConstants = IntegrationTestPuppetConstants;
 
 [[nodiscard]] std::vector<orbit_grpc_protos::ProducerCaptureEvent> TraceAndGetEvents(
     LinuxTracingIntegrationTestFixture* fixture, std::string_view command,
@@ -672,7 +590,7 @@ void AddOuterAndInnerFunctionToCaptureOptions(orbit_grpc_protos::CaptureOptions*
 }
 
 void VerifyFunctionCallsOfOuterAndInnerFunction(
-    const std::vector<orbit_grpc_protos::ProducerCaptureEvent>& events, pid_t pid,
+    const std::vector<orbit_grpc_protos::ProducerCaptureEvent>& events, uint32_t pid,
     uint64_t outer_function_id, uint64_t inner_function_id) {
   std::vector<orbit_grpc_protos::FunctionCall> function_calls;
   for (const auto& event : events) {
@@ -736,7 +654,7 @@ TEST(LinuxTracingIntegrationTest, FunctionCalls) {
   orbit_grpc_protos::CaptureOptions capture_options = fixture.BuildDefaultCaptureOptions();
   constexpr uint64_t kOuterFunctionId = 1;
   constexpr uint64_t kInnerFunctionId = 2;
-  AddOuterAndInnerFunctionToCaptureOptions(&capture_options, fixture.GetPuppetPid(),
+  AddOuterAndInnerFunctionToCaptureOptions(&capture_options, fixture.GetPuppetPidNative(),
                                            kOuterFunctionId, kInnerFunctionId);
 
   std::vector<orbit_grpc_protos::ProducerCaptureEvent> events =
@@ -825,7 +743,7 @@ absl::flat_hash_set<uint64_t> VerifyAndGetAddressInfosWithOuterAndInnerFunction(
 }
 
 void VerifyCallstackSamplesWithOuterAndInnerFunction(
-    const std::vector<orbit_grpc_protos::ProducerCaptureEvent>& events, pid_t pid,
+    const std::vector<orbit_grpc_protos::ProducerCaptureEvent>& events, uint32_t pid,
     std::pair<uint64_t, uint64_t> outer_function_virtual_address_range,
     std::pair<uint64_t, uint64_t> inner_function_virtual_address_range, double sampling_rate,
     const absl::flat_hash_set<uint64_t>* address_infos_received, bool unwound_with_frame_pointers) {
@@ -913,7 +831,7 @@ void VerifyCallstackSamplesWithOuterAndInnerFunction(
 }
 
 void VerifyCallstackSamplesWithOuterAndInnerFunctionForDwarfUnwinding(
-    const std::vector<orbit_grpc_protos::ProducerCaptureEvent>& events, pid_t pid,
+    const std::vector<orbit_grpc_protos::ProducerCaptureEvent>& events, uint32_t pid,
     std::pair<uint64_t, uint64_t> outer_function_virtual_address_range,
     std::pair<uint64_t, uint64_t> inner_function_virtual_address_range, double sampling_rate,
     const absl::flat_hash_set<uint64_t>* address_infos_received) {
@@ -923,7 +841,7 @@ void VerifyCallstackSamplesWithOuterAndInnerFunctionForDwarfUnwinding(
 }
 
 void VerifyCallstackSamplesWithOuterAndInnerFunctionForFramePointerUnwinding(
-    const std::vector<orbit_grpc_protos::ProducerCaptureEvent>& events, pid_t pid,
+    const std::vector<orbit_grpc_protos::ProducerCaptureEvent>& events, uint32_t pid,
     std::pair<uint64_t, uint64_t> outer_function_virtual_address_range,
     std::pair<uint64_t, uint64_t> inner_function_virtual_address_range, double sampling_rate,
     const absl::flat_hash_set<uint64_t>* address_infos_received) {
@@ -939,8 +857,9 @@ TEST(LinuxTracingIntegrationTest, CallstackSamplesAndAddressInfos) {
   LinuxTracingIntegrationTestFixture fixture;
 
   const auto& [outer_function_virtual_address_range, inner_function_virtual_address_range] =
-      GetOuterAndInnerFunctionVirtualAddressRanges(fixture.GetPuppetPid());
-  const std::filesystem::path& executable_path = GetExecutableBinaryPath(fixture.GetPuppetPid());
+      GetOuterAndInnerFunctionVirtualAddressRanges(fixture.GetPuppetPidNative());
+  const std::filesystem::path& executable_path =
+      GetExecutableBinaryPath(fixture.GetPuppetPidNative());
 
   orbit_grpc_protos::CaptureOptions capture_options = fixture.BuildDefaultCaptureOptions();
   const double samples_per_second = capture_options.samples_per_second();
@@ -971,13 +890,14 @@ TEST(LinuxTracingIntegrationTest, CallstackSamplesTogetherWithFunctionCalls) {
   LinuxTracingIntegrationTestFixture fixture;
 
   const auto& [outer_function_virtual_address_range, inner_function_virtual_address_range] =
-      GetOuterAndInnerFunctionVirtualAddressRanges(fixture.GetPuppetPid());
-  const std::filesystem::path& executable_path = GetExecutableBinaryPath(fixture.GetPuppetPid());
+      GetOuterAndInnerFunctionVirtualAddressRanges(fixture.GetPuppetPidNative());
+  const std::filesystem::path& executable_path =
+      GetExecutableBinaryPath(fixture.GetPuppetPidNative());
 
   orbit_grpc_protos::CaptureOptions capture_options = fixture.BuildDefaultCaptureOptions();
   constexpr uint64_t kOuterFunctionId = 1;
   constexpr uint64_t kInnerFunctionId = 2;
-  AddOuterAndInnerFunctionToCaptureOptions(&capture_options, fixture.GetPuppetPid(),
+  AddOuterAndInnerFunctionToCaptureOptions(&capture_options, fixture.GetPuppetPidNative(),
                                            kOuterFunctionId, kInnerFunctionId);
   const double sampling_rate = capture_options.samples_per_second();
 
@@ -1014,7 +934,7 @@ TEST(LinuxTracingIntegrationTest, CallstackSamplesWithFramePointers) {
   LinuxTracingIntegrationTestFixture fixture;
 
   const auto& [outer_function_virtual_address_range, inner_function_virtual_address_range] =
-      GetOuterAndInnerFunctionVirtualAddressRanges(fixture.GetPuppetPid());
+      GetOuterAndInnerFunctionVirtualAddressRanges(fixture.GetPuppetPidNative());
 
   orbit_grpc_protos::CaptureOptions capture_options = fixture.BuildDefaultCaptureOptions();
   capture_options.set_unwinding_method(orbit_grpc_protos::CaptureOptions::kFramePointers);
@@ -1047,13 +967,13 @@ TEST(LinuxTracingIntegrationTest, CallstackSamplesWithFramePointersTogetherWithF
   LinuxTracingIntegrationTestFixture fixture;
 
   const auto& [outer_function_virtual_address_range, inner_function_virtual_address_range] =
-      GetOuterAndInnerFunctionVirtualAddressRanges(fixture.GetPuppetPid());
+      GetOuterAndInnerFunctionVirtualAddressRanges(fixture.GetPuppetPidNative());
 
   orbit_grpc_protos::CaptureOptions capture_options = fixture.BuildDefaultCaptureOptions();
   capture_options.set_unwinding_method(orbit_grpc_protos::CaptureOptions::kFramePointers);
   constexpr uint64_t kOuterFunctionId = 1;
   constexpr uint64_t kInnerFunctionId = 2;
-  AddOuterAndInnerFunctionToCaptureOptions(&capture_options, fixture.GetPuppetPid(),
+  AddOuterAndInnerFunctionToCaptureOptions(&capture_options, fixture.GetPuppetPidNative(),
                                            kOuterFunctionId, kInnerFunctionId);
   const double sampling_rate = capture_options.samples_per_second();
 

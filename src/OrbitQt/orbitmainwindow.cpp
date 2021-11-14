@@ -114,6 +114,7 @@
 #include "absl/flags/flag.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_format.h"
+#include "capture.pb.h"
 #include "capture_data.pb.h"
 #include "orbitaboutdialog.h"
 #include "orbitdataviewpanel.h"
@@ -127,6 +128,7 @@
 using orbit_capture_client::CaptureClient;
 using orbit_capture_client::CaptureListener;
 
+using orbit_grpc_protos::CaptureOptions;
 using orbit_grpc_protos::CrashOrbitServiceRequest_CrashType;
 using orbit_grpc_protos::CrashOrbitServiceRequest_CrashType_CHECK_FALSE;
 using orbit_grpc_protos::CrashOrbitServiceRequest_CrashType_STACK_OVERFLOW;
@@ -138,6 +140,10 @@ using orbit_session_setup::TargetConfiguration;
 using orbit_session_setup::TargetLabel;
 
 using orbit_data_views::DataViewType;
+
+using DynamicInstrumentationMethod =
+    orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod;
+using UnwindingMethod = orbit_grpc_protos::CaptureOptions::UnwindingMethod;
 
 namespace {
 const QString kLightGrayColor = "rgb(117, 117, 117)";
@@ -253,6 +259,7 @@ void OrbitMainWindow::SetupMainWindow() {
   DataViewFactory* data_view_factory = app_.get();
 
   ui->setupUi(this);
+  RestoreMainWindowGeometry();
 
   ui->splitter_2->setSizes({5000, 5000});
 
@@ -569,6 +576,18 @@ void OrbitMainWindow::SaveCurrentTabLayoutAsDefaultInMemory() {
     layout.current_index = tab_widget->currentIndex();
     default_tab_layout_[tab_widget] = layout;
   }
+}
+
+void OrbitMainWindow::SaveMainWindowGeometry() {
+  QSettings settings;
+  settings.setValue(kMainWindowGeometrySettingKey, saveGeometry());
+  settings.setValue(kMainWindowStateSettingKey, saveState());
+}
+
+void OrbitMainWindow::RestoreMainWindowGeometry() {
+  QSettings settings;
+  restoreGeometry(settings.value(kMainWindowGeometrySettingKey).toByteArray());
+  restoreState(settings.value(kMainWindowStateSettingKey).toByteArray());
 }
 
 void OrbitMainWindow::CreateTabBarContextMenu(QTabWidget* tab_widget, int tab_index,
@@ -1053,20 +1072,23 @@ const QString OrbitMainWindow::kTraceGpuSubmissionsSettingKey{"TraceGpuSubmissio
 const QString OrbitMainWindow::kCollectMemoryInfoSettingKey{"CollectMemoryInfo"};
 const QString OrbitMainWindow::kEnableApiSettingKey{"EnableApi"};
 const QString OrbitMainWindow::kEnableIntrospectionSettingKey{"EnableIntrospection"};
-const QString OrbitMainWindow::kEnableUserSpaceInstrumentationSettingKey{
-    "EnableUserSpaceInstrumentation"};
+const QString OrbitMainWindow::kDynamicInstrumentationMethodSettingKey{
+    "DynamicInstrumentationMethod"};
 const QString OrbitMainWindow::kMemorySamplingPeriodMsSettingKey{"MemorySamplingPeriodMs"};
 const QString OrbitMainWindow::kMemoryWarningThresholdKbSettingKey{"MemoryWarningThresholdKb"};
 const QString OrbitMainWindow::kLimitLocalMarkerDepthPerCommandBufferSettingsKey{
     "LimitLocalMarkerDepthPerCommandBuffer"};
 const QString OrbitMainWindow::kMaxLocalMarkerDepthPerCommandBufferSettingsKey{
     "MaxLocalMarkerDepthPerCommandBuffer"};
+const QString OrbitMainWindow::kMainWindowGeometrySettingKey{"MainWindowGeometry"};
+const QString OrbitMainWindow::kMainWindowStateSettingKey{"MainWindowState"};
 
 constexpr double kCallstackSamplingPeriodMsDefaultValue = 1.0;
-constexpr orbit_grpc_protos::UnwindingMethod kCallstackUnwindingMethodDefaultValue =
-    orbit_grpc_protos::UnwindingMethod::kDwarfUnwinding;
+constexpr UnwindingMethod kCallstackUnwindingMethodDefaultValue = CaptureOptions::kDwarf;
 constexpr uint64_t kMemorySamplingPeriodMsDefaultValue = 10;
 constexpr uint64_t kMemoryWarningThresholdKbDefaultValue = 1024 * 1024 * 8;  // 8Gb
+constexpr DynamicInstrumentationMethod kDynamicInstrumentationMethodDefaultValue =
+    CaptureOptions::kKernelUprobes;
 
 void OrbitMainWindow::LoadCaptureOptionsIntoApp() {
   QSettings settings;
@@ -1085,12 +1107,15 @@ void OrbitMainWindow::LoadCaptureOptionsIntoApp() {
     }
     app_->SetSamplesPerSecond(1000.0 / sampling_period_ms);
 
-    orbit_grpc_protos::UnwindingMethod unwinding_method =
-        static_cast<orbit_grpc_protos::UnwindingMethod>(
-            settings
-                .value(kCallstackUnwindingMethodSettingKey,
-                       static_cast<int>(kCallstackUnwindingMethodDefaultValue))
-                .toInt());
+    UnwindingMethod unwinding_method = static_cast<UnwindingMethod>(
+        settings
+            .value(kCallstackUnwindingMethodSettingKey,
+                   static_cast<int>(kCallstackUnwindingMethodDefaultValue))
+            .toInt());
+    if (unwinding_method != CaptureOptions::kDwarf &&
+        unwinding_method != CaptureOptions::kFramePointers) {
+      unwinding_method = kCallstackUnwindingMethodDefaultValue;
+    }
     app_->SetUnwindingMethod(unwinding_method);
   } else {
     app_->SetSamplesPerSecond(0.0);
@@ -1101,8 +1126,16 @@ void OrbitMainWindow::LoadCaptureOptionsIntoApp() {
   app_->SetTraceGpuSubmissions(settings.value(kTraceGpuSubmissionsSettingKey, true).toBool());
   app_->SetEnableApi(settings.value(kEnableApiSettingKey, true).toBool());
   app_->SetEnableIntrospection(settings.value(kEnableIntrospectionSettingKey, false).toBool());
-  app_->SetEnableUserSpaceInstrumentation(
-      settings.value(kEnableUserSpaceInstrumentationSettingKey, false).toBool());
+  DynamicInstrumentationMethod instrumentation_method = static_cast<DynamicInstrumentationMethod>(
+      settings
+          .value(kDynamicInstrumentationMethodSettingKey,
+                 static_cast<int>(kDynamicInstrumentationMethodDefaultValue))
+          .toInt());
+  if (instrumentation_method != CaptureOptions::kKernelUprobes &&
+      instrumentation_method != CaptureOptions::kUserSpaceInstrumentation) {
+    instrumentation_method = kDynamicInstrumentationMethodDefaultValue;
+  }
+  app_->SetDynamicInstrumentationMethod(instrumentation_method);
 
   app_->SetCollectMemoryInfo(settings.value(kCollectMemoryInfoSettingKey, false).toBool());
   uint64_t memory_sampling_period_ms = kMemorySamplingPeriodMsDefaultValue;
@@ -1138,18 +1171,31 @@ void OrbitMainWindow::on_actionCaptureOptions_triggered() {
   dialog.SetSamplingPeriodMs(
       settings.value(kCallstackSamplingPeriodMsSettingKey, kCallstackSamplingPeriodMsDefaultValue)
           .toDouble());
-  dialog.SetUnwindingMethod(static_cast<orbit_grpc_protos::UnwindingMethod>(
+  UnwindingMethod unwinding_method = static_cast<UnwindingMethod>(
       settings
           .value(kCallstackUnwindingMethodSettingKey,
                  static_cast<int>(kCallstackUnwindingMethodDefaultValue))
-          .toInt()));
+          .toInt());
+  if (unwinding_method != CaptureOptions::kDwarf &&
+      unwinding_method != CaptureOptions::kFramePointers) {
+    unwinding_method = kCallstackUnwindingMethodDefaultValue;
+  }
+  dialog.SetUnwindingMethod(unwinding_method);
   dialog.SetCollectSchedulerInfo(settings.value(kCollectSchedulerInfoSettingKey, true).toBool());
   dialog.SetCollectThreadStates(settings.value(kCollectThreadStatesSettingKey, false).toBool());
   dialog.SetTraceGpuSubmissions(settings.value(kTraceGpuSubmissionsSettingKey, true).toBool());
   dialog.SetEnableApi(settings.value(kEnableApiSettingKey, true).toBool());
   dialog.SetEnableIntrospection(settings.value(kEnableIntrospectionSettingKey, true).toBool());
-  dialog.SetEnableUserSpaceInstrumentation(
-      settings.value(kEnableUserSpaceInstrumentationSettingKey, false).toBool());
+  DynamicInstrumentationMethod instrumentation_method = static_cast<DynamicInstrumentationMethod>(
+      settings
+          .value(kDynamicInstrumentationMethodSettingKey,
+                 static_cast<int>(kDynamicInstrumentationMethodDefaultValue))
+          .toInt());
+  if (instrumentation_method != CaptureOptions::kKernelUprobes &&
+      instrumentation_method != CaptureOptions::kUserSpaceInstrumentation) {
+    instrumentation_method = kDynamicInstrumentationMethodDefaultValue;
+  }
+  dialog.SetDynamicInstrumentationMethod(instrumentation_method);
   dialog.SetCollectMemoryInfo(settings.value(kCollectMemoryInfoSettingKey, false).toBool());
   dialog.SetMemorySamplingPeriodMs(
       settings
@@ -1180,8 +1226,8 @@ void OrbitMainWindow::on_actionCaptureOptions_triggered() {
   settings.setValue(kTraceGpuSubmissionsSettingKey, dialog.GetTraceGpuSubmissions());
   settings.setValue(kEnableApiSettingKey, dialog.GetEnableApi());
   settings.setValue(kEnableIntrospectionSettingKey, dialog.GetEnableIntrospection());
-  settings.setValue(kEnableUserSpaceInstrumentationSettingKey,
-                    dialog.GetEnableUserSpaceInstrumentation());
+  settings.setValue(kDynamicInstrumentationMethodSettingKey,
+                    static_cast<int>(dialog.GetDynamicInstrumentationMethod()));
   settings.setValue(kCollectMemoryInfoSettingKey, dialog.GetCollectMemoryInfo());
   settings.setValue(kMemorySamplingPeriodMsSettingKey,
                     QString::number(dialog.GetMemorySamplingPeriodMs()));
@@ -1414,6 +1460,8 @@ bool OrbitMainWindow::ConfirmExit() {
 }
 
 void OrbitMainWindow::Exit(int return_code) {
+  SaveMainWindowGeometry();
+
   if (app_->IsCapturing() || app_->IsLoadingCapture()) {
     // We need for the capture to clean up - exit as soon as this is done
     app_->SetCaptureFailedCallback([this, return_code] { Exit(return_code); });

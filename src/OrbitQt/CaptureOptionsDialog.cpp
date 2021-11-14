@@ -15,7 +15,14 @@
 
 #include "ClientFlags/ClientFlags.h"
 #include "ui_CaptureOptionsDialog.h"
+
 namespace orbit_qt {
+
+using orbit_grpc_protos::CaptureOptions;
+
+using DynamicInstrumentationMethod =
+    orbit_grpc_protos::CaptureOptions::DynamicInstrumentationMethod;
+using UnwindingMethod = orbit_grpc_protos::CaptureOptions::UnwindingMethod;
 
 CaptureOptionsDialog::CaptureOptionsDialog(QWidget* parent)
     : QDialog{parent}, ui_(std::make_unique<Ui::CaptureOptionsDialog>()) {
@@ -24,19 +31,19 @@ CaptureOptionsDialog::CaptureOptionsDialog(QWidget* parent)
   QObject::connect(ui_->buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
   QObject::connect(ui_->buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
-  ui_->unwindingMethodComboBox->addItem(
-      "DWARF", static_cast<int>(orbit_grpc_protos::UnwindingMethod::kDwarfUnwinding));
-  ui_->unwindingMethodComboBox->addItem(
-      "Frame pointers",
-      static_cast<int>(orbit_grpc_protos::UnwindingMethod::kFramePointerUnwinding));
-
+  ui_->unwindingMethodComboBox->addItem("DWARF", static_cast<int>(CaptureOptions::kDwarf));
+  ui_->unwindingMethodComboBox->addItem("Frame pointers",
+                                        static_cast<int>(CaptureOptions::kFramePointers));
+  ui_->dynamicInstrumentationMethodComboBox->addItem(
+      "Kernel (Uprobes)", static_cast<int>(CaptureOptions::kKernelUprobes));
+  ui_->dynamicInstrumentationMethodComboBox->addItem(
+      "Orbit", static_cast<int>(CaptureOptions::kUserSpaceInstrumentation));
   if (!absl::GetFlag(FLAGS_devmode)) {
     // TODO(b/198748597): Don't hide samplingCheckBox once disabling sampling completely is exposed.
     ui_->samplingCheckBox->hide();
     ui_->unwindingMethodWidget->hide();
     ui_->schedulerCheckBox->hide();
     ui_->gpuSubmissionsCheckBox->hide();
-    ui_->userspaceCheckBox->hide();
     ui_->introspectionCheckBox->hide();
   }
 
@@ -64,15 +71,14 @@ double CaptureOptionsDialog::GetSamplingPeriodMs() const {
   return ui_->samplingPeriodMsDoubleSpinBox->value();
 }
 
-void CaptureOptionsDialog::SetUnwindingMethod(orbit_grpc_protos::UnwindingMethod unwinding_method) {
+void CaptureOptionsDialog::SetUnwindingMethod(UnwindingMethod unwinding_method) {
   int index = ui_->unwindingMethodComboBox->findData(static_cast<int>(unwinding_method));
   CHECK(index >= 0);
   return ui_->unwindingMethodComboBox->setCurrentIndex(index);
 }
 
-orbit_grpc_protos::UnwindingMethod CaptureOptionsDialog::GetUnwindingMethod() const {
-  return static_cast<orbit_grpc_protos::UnwindingMethod>(
-      ui_->unwindingMethodComboBox->currentData().toInt());
+UnwindingMethod CaptureOptionsDialog::GetUnwindingMethod() const {
+  return static_cast<UnwindingMethod>(ui_->unwindingMethodComboBox->currentData().toInt());
 }
 
 void CaptureOptionsDialog::SetCollectSchedulerInfo(bool collect_scheduler_info) {
@@ -105,12 +111,15 @@ void CaptureOptionsDialog::SetEnableApi(bool enable_api) {
 
 bool CaptureOptionsDialog::GetEnableApi() const { return ui_->apiCheckBox->isChecked(); }
 
-void CaptureOptionsDialog::SetEnableUserSpaceInstrumentation(bool enable) {
-  ui_->userspaceCheckBox->setChecked(enable);
+void CaptureOptionsDialog::SetDynamicInstrumentationMethod(DynamicInstrumentationMethod method) {
+  const int index = ui_->dynamicInstrumentationMethodComboBox->findData(static_cast<int>(method));
+  CHECK(index >= 0);
+  ui_->dynamicInstrumentationMethodComboBox->setCurrentIndex(index);
 }
 
-bool CaptureOptionsDialog::GetEnableUserSpaceInstrumentation() const {
-  return ui_->userspaceCheckBox->isChecked();
+DynamicInstrumentationMethod CaptureOptionsDialog::GetDynamicInstrumentationMethod() const {
+  return static_cast<DynamicInstrumentationMethod>(
+      ui_->dynamicInstrumentationMethodComboBox->currentData().toInt());
 }
 
 void CaptureOptionsDialog::SetEnableIntrospection(bool enable_introspection) {

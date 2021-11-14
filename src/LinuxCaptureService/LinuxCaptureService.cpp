@@ -30,6 +30,7 @@
 #include "ProducerEventProcessor/GrpcClientCaptureEventCollector.h"
 #include "ProducerEventProcessor/ProducerEventProcessor.h"
 #include "TracingHandler.h"
+#include "UserSpaceInstrumentationAddressesImpl.h"
 #include "capture.pb.h"
 
 using orbit_grpc_protos::CaptureFinished;
@@ -113,17 +114,55 @@ static void StopInternalProducersAndCaptureStartStopListenersInParallel(
   }
 }
 
+namespace {
+
+// This class hijacks FunctionEntry and FunctionExit events before they reach the
+// ProducerEventProcessor, and sends them to LinuxTracing instead, so that they can be processed
+// like u(ret)probes. All the other events are forwarded to the ProducerEventProcessor normally.
+class ProducerEventProcessorHijackingFunctionEntryExitForLinuxTracing
+    : public ProducerEventProcessor {
+ public:
+  ProducerEventProcessorHijackingFunctionEntryExitForLinuxTracing(
+      ProducerEventProcessor* original_producer_event_processor, TracingHandler* tracing_handler)
+      : producer_event_processor_{original_producer_event_processor},
+        tracing_handler_{tracing_handler} {}
+  ~ProducerEventProcessorHijackingFunctionEntryExitForLinuxTracing() override = default;
+
+  void ProcessEvent(uint64_t producer_id,
+                    orbit_grpc_protos::ProducerCaptureEvent&& event) override {
+    switch (event.event_case()) {
+      case ProducerCaptureEvent::kFunctionEntry:
+        tracing_handler_->ProcessFunctionEntry(event.function_entry());
+        break;
+      case ProducerCaptureEvent::kFunctionExit:
+        tracing_handler_->ProcessFunctionExit(event.function_exit());
+        break;
+      case ProducerCaptureEvent::EVENT_NOT_SET:
+        UNREACHABLE();
+      default:
+        producer_event_processor_->ProcessEvent(producer_id, std::move(event));
+    }
+  }
+
+ private:
+  ProducerEventProcessor* producer_event_processor_;
+  TracingHandler* tracing_handler_;
+};
+
+}  // namespace
+
 grpc::Status LinuxCaptureService::Capture(
     grpc::ServerContext* /*context*/,
     grpc::ServerReaderWriter<CaptureResponse, CaptureRequest>* reader_writer) {
   orbit_base::SetCurrentThreadName("CSImpl::Capture");
 
-  grpc::Status result = InitializeCapture(reader_writer);
-  if (!result.ok()) {
+  if (grpc::Status result = InitializeCapture(reader_writer); !result.ok()) {
     return result;
   }
 
   TracingHandler tracing_handler{producer_event_processor_.get()};
+  ProducerEventProcessorHijackingFunctionEntryExitForLinuxTracing function_entry_exit_hijacker{
+      producer_event_processor_.get(), &tracing_handler};
   MemoryInfoHandler memory_info_handler{producer_event_processor_.get()};
 
   CaptureRequest request = WaitForStartCaptureRequestFromClient(reader_writer);
@@ -147,7 +186,9 @@ grpc::Status LinuxCaptureService::Capture(
 
   // Enable user space instrumentation.
   std::optional<std::string> error_enabling_user_space_instrumentation;
-  if (capture_options.enable_user_space_instrumentation() &&
+  std::unique_ptr<UserSpaceInstrumentationAddressesImpl> user_space_instrumentation_addresses;
+  if (capture_options.dynamic_instrumentation_method() ==
+          CaptureOptions::kUserSpaceInstrumentation &&
       capture_options.instrumented_functions_size() != 0) {
     auto result_or_error = instrumentation_manager_->InstrumentProcess(capture_options);
     if (result_or_error.has_error()) {
@@ -160,6 +201,11 @@ grpc::Status LinuxCaptureService::Capture(
       LOG("User space instrumentation enabled for %u out of %u instrumented functions.",
           result_or_error.value().instrumented_function_ids.size(),
           capture_options.instrumented_functions_size());
+      user_space_instrumentation_addresses =
+          std::make_unique<UserSpaceInstrumentationAddressesImpl>(
+              result_or_error.value().entry_trampoline_address_ranges,
+              result_or_error.value().return_trampoline_address_range,
+              result_or_error.value().injected_library_path.string());
     }
   }
 
@@ -185,11 +231,12 @@ grpc::Status LinuxCaptureService::Capture(
     introspection_listener = CreateIntrospectionListener(producer_event_processor_.get());
   }
 
-  tracing_handler.Start(linux_tracing_capture_options);
+  tracing_handler.Start(linux_tracing_capture_options,
+                        std::move(user_space_instrumentation_addresses));
 
   memory_info_handler.Start(request.capture_options());
   for (CaptureStartStopListener* listener : capture_start_stop_listeners_) {
-    listener->OnCaptureStartRequested(request.capture_options(), producer_event_processor_.get());
+    listener->OnCaptureStartRequested(request.capture_options(), &function_entry_exit_hijacker);
   }
 
   WaitForEndCaptureRequestFromClient(reader_writer);
@@ -208,7 +255,8 @@ grpc::Status LinuxCaptureService::Capture(
   }
 
   // Disable user space instrumentation.
-  if (capture_options.enable_user_space_instrumentation() &&
+  if (capture_options.dynamic_instrumentation_method() ==
+          CaptureOptions::kUserSpaceInstrumentation &&
       capture_options.instrumented_functions_size() != 0) {
     const pid_t target_process_id = orbit_base::ToNativeProcessId(capture_options.pid());
     auto result_tmp = instrumentation_manager_->UninstrumentProcess(target_process_id);
